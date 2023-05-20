@@ -14,11 +14,18 @@ import os
 import pandas as pd
 import tiktoken
 import openai
+import pinecone
 import numpy as np
 from openai.embeddings_utils import distances_from_embeddings, cosine_similarity
+from uuid import uuid4
+from tqdm.auto import tqdm
 
 config = dotenv_values(".env")
 openai.api_key = config["OPENAI_API_KEY"]
+
+PINECONE_API_KEY = config["PINECONE_KEY"]
+PINECONE_API_ENV = config["PINECONE_ENV"]
+print("start :- " + PINECONE_API_KEY + " env: " + PINECONE_API_ENV)
 
 # Regex pattern to match a URL
 HTTP_URL_PATTERN = r'^http[s]{0,1}://.+$'
@@ -294,92 +301,134 @@ def prep_df(domain):
 
 
     df['embeddings'] = df.text.apply(lambda x: openai.Embedding.create(input=x, engine='text-embedding-ada-002')['data'][0]['embedding'])
-    df.to_csv('app/webcrawler/processed/embeddings.csv')
+    #df.to_csv('app/webcrawler/processed/embeddings.csv')
+    # store the df into Pinecone DB.
+    
+    # Add an 'id' column to the DataFrame
+    df['id'] = [str(uuid4()) for _ in range(len(df))]
+
+    # Define index name
+    index_name = 'quickquacktest'
+
+    # Initialize connection to Pinecone
+    pinecone.init(api_key=PINECONE_API_KEY, environment=PINECONE_API_ENV)
+
+    # Check if index already exists, create it if it doesn't
+    try:
+        if index_name not in pinecone.list_indexes():
+            pinecone.create_index(index_name, dimension=1536, metric='dotproduct')
+    except Exception as e:
+        print(e)
+  
+
+    # Connect to the index and view index stats
+    index = pinecone.Index(index_name)
+    index.describe_index_stats()
+
+    batch_size = 100  # how many embeddings we create and insert at once
+    # Upsert ends up adding duplicate vectors instead of updating, So delete the exsisting namespace before adding new vectors.
+    try:
+        #delete_response = index.delete(delete_all=True,namespace='mvb') -- With Namespace.
+        delete_response = index.delete(delete_all=True)
+    except Exception as e:
+        print(e)
+
+    # Convert the DataFrame to a list of dictionaries
+    text_chunks = df.to_dict(orient='records')
+
+
+    # Upsert embeddings into Pinecone in batches of 100
+    for i in tqdm(range(0, len(text_chunks), batch_size)):
+        i_end = min(len(text_chunks), i+batch_size)
+        meta_batch = text_chunks[i:i_end]
+        ids_batch = [x['id'] for x in meta_batch]
+        embeds = [x['embeddings'] for x in meta_batch]
+        meta_batch = [{
+            'text': x['text']
+        } for x in meta_batch]
+        to_upsert = list(zip(ids_batch, embeds, meta_batch))
+        #index.upsert(vectors=to_upsert, namespace="mvb") -- With Namespace.
+        index.upsert(vectors=to_upsert)
+        print("upsert done")
 
 
 ################################################################################
 ### Step 11
 ################################################################################
 
-    df=pd.read_csv('app/webcrawler/processed/embeddings.csv', index_col=0)
-    df['embeddings'] = df['embeddings'].apply(eval).apply(np.array)
+    #df=pd.read_csv('app/webcrawler/processed/embeddings.csv', index_col=0)
+    #df['embeddings'] = df['embeddings'].apply(eval).apply(np.array)
 
-    return df
+    #return df
 
 ################################################################################
 ### Step 12
 ################################################################################
 
-def create_context(
-    question, df, max_len=1800, size="ada"
-):
-    """
-    Create a context for a question by finding the most similar context from the dataframe
-    """
+limit = 3750
 
-    # Get the embeddings for the question
-    q_embeddings = openai.Embedding.create(input=question, engine='text-embedding-ada-002')['data'][0]['embedding']
-
-    # Get the distances from the embeddings
-    df['distances'] = distances_from_embeddings(q_embeddings, df['embeddings'].values, distance_metric='cosine')
-
-
-    returns = []
-    cur_len = 0
-
-    # Sort by distance and add the text to the context until the context is too long
-    for i, row in df.sort_values('distances', ascending=True).iterrows():
-        
-        # Add the length of the text to the current length
-        cur_len += row['n_tokens'] + 4
-        
-        # If the context is too long, break
-        if cur_len > max_len:
-            break
-        
-        # Else add it to the text that is being returned
-        returns.append(row["text"])
-
-    # Return the context
-    return "\n\n###\n\n".join(returns)
-
-def answer_question(
-    df,
-    model="text-davinci-003",
-    question="Am I allowed to publish model outputs to Twitter, without a human review?",
-    max_len=1800,
-    size="ada",
-    debug=False,
-    max_tokens=150,
-    stop_sequence=None
-):
-    """
-    Answer a question based on the most similar context from the dataframe texts
-    """
-    context = create_context(
-        question,
-        df,
-        max_len=max_len,
-        size=size,
+def retrieve(query):
+    res = openai.Embedding.create(
+        input=[query],
+        engine='text-embedding-ada-002'
     )
-    # If debug, print the raw model response
-    if debug:
-        print("Context:\n" + context)
-        print("\n\n")
+
+    # Define index name
+    index_name = 'quickquacktest'
+    # Connect to the index and view index stats
+    index = pinecone.Index(index_name)
+    index.describe_index_stats()
+
+
+    # retrieve from Pinecone
+    xq = res['data'][0]['embedding']
+
+    # get relevant contexts
+    res = index.query(xq, top_k=3, include_metadata=True)
+    contexts = [
+        x['metadata']['text'] for x in res['matches']
+    ]
+
+    # build our prompt with the retrieved contexts included
+    prompt_start = (
+        "Answer the question based on the context below. If you don't know the answer, just say that you don't know. Don't try to make up an answer.\n\n"+
+        "Context:\n"
+    )
+    prompt_end = (
+        f"\n\nQuestion: {query}\nAnswer:"
+    )
+    # append contexts until hitting limit
+    for i in range(1, len(contexts)):
+        if len("\n\n---\n\n".join(contexts[:i])) >= limit:
+            prompt = (
+                prompt_start +
+                "\n\n---\n\n".join(contexts[:i-1]) +
+                prompt_end
+            )
+            break
+        elif i == len(contexts)-1:
+            prompt = (
+                prompt_start +
+                "\n\n---\n\n".join(contexts) +
+                prompt_end
+            )
+    return prompt
+
+    
+
+def answer_question(question):
+
+    query_with_contexts = retrieve(question)
 
     try:
-        # Create a completions using the questin and context
-        response = openai.Completion.create(
-            prompt=f"Answer the question based on the context below, and if the question can't be answered based on the context, say \"I don't know\"\n\nContext: {context}\n\n---\n\nQuestion: {question}\nAnswer:",
-            temperature=0,
-            max_tokens=max_tokens,
-            top_p=1,
-            frequency_penalty=0,
-            presence_penalty=0,
-            stop=stop_sequence,
-            model=model,
+        chat = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": "You are a Q&A assistant."},
+                {"role": "user", "content": query_with_contexts}
+            ]
         )
-        return response["choices"][0]["text"].strip()
+        return chat["choices"][0]['message']['content']
     except Exception as e:
         print(e)
         return ""
