@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+<link rel="stylesheet" href="{{ url_for('static', filename='chat.css') }}">
+
+<head>
+    <meta charset="UTF-8">
+    <title>Chatbot</title>
+    <link href="https://fonts.googleapis.com/icon?family=Material+Icons"
+      rel="stylesheet">
+</head>
+<body>
+<div class="container">
+    <div class="chatbot">
+        <div class="chatbot-support">
+            <div class="chatbot-header">
+                <div class="chatbot-image--header">
+                    <img src="https://img.icons8.com/color/48/000000/circled-user-female-skin-type-5--v1.png" alt="image">
+                </div>
+                <div class="chatbot-content--header">
+                    <h4 class="chatbot-heading--header">Chat support</h4>
+                    <p class="chatbot-description--header">Hi. My name is Missy. How can I help you?</p>
+                </div>
+            </div>
+            <div class="chatbot-messages">
+                <div></div>
+            </div>
+            <div class="chatbot-footer">
+                <input type="text" placeholder="Write a message...">
+                <button class="chatbot-send--footer send-button">Send</button>
+            </div>
+        </div>
+        <div class="chatbot-button">
+            <button><span class="material-icons">question_answer</span></button>
+        </div>
+    </div>
+</div>
+
+    <script>
+        $SCRIPT_ROOT = {{ request.script_root|tojson }};
+    </script>
+    <script type="text/javascript" src="{{ url_for('static', filename='chat.js') }}"></script>
+
+</body>
+</html>

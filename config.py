@@ -15,6 +15,8 @@ class Config:
     TESTING = False
     WTF_CSRF_ENABLED = True
     OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
+    PINECONE_KEY = os.getenv('PINECONE_KEY')
+    PINECONE_ENV = os.getenv('PINECONE_ENV')
     # Settings applicable to all environments
     SECRET_KEY = os.getenv('SECRET_KEY', default='A very terrible secret key.')
     # SQLALCHEMY_TRACK_MODIFICATIONS = False

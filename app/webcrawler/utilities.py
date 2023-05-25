@@ -14,18 +14,46 @@ import os
 import pandas as pd
 import tiktoken
 import openai
+import pinecone
 import numpy as np
 from openai.embeddings_utils import distances_from_embeddings, cosine_similarity
+from uuid import uuid4
+import gzip
+from tqdm.auto import tqdm
+import shutil
 
 config = dotenv_values(".env")
 openai.api_key = config["OPENAI_API_KEY"]
+PINECONE_API_KEY = config["PINECONE_KEY"]
+PINECONE_API_ENV = config["PINECONE_ENV"]
+
 
 # Regex pattern to match a URL
 HTTP_URL_PATTERN = r'^http[s]{0,1}://.+$'
 
-# Define root domain to crawl
-# domain = "aperturecoffeebar.com"
-# full_url = "http://www.aperturecoffeebar.com/"
+# Helper to check namespace
+def extract_domain_name(domain):
+    # Remove the top-level domain (e.g., ".ca") using the split() method
+    domain_parts = domain.split(".")
+    domain_name = domain_parts[0]
+    return domain_name
+
+# check if namespace exists
+def check_namespace(domain):
+    namespace = extract_domain_name(domain)
+    # Initialize connection to Pinecone
+    pinecone.init(api_key=PINECONE_API_KEY, environment=PINECONE_API_ENV)
+     # Define index name
+    index_name = 'quickquacktest'
+
+    # Connect to the index and view index stats
+    index = pinecone.Index(index_name)
+    index_stats = index.describe_index_stats()
+    # Check if namespace exists
+    if namespace in index_stats['namespaces']:
+        return True
+    else:
+        return False
 
 # Create a class to parse the HTML and get the hyperlinks
 class HyperlinkParser(HTMLParser):
@@ -58,8 +86,17 @@ def get_hyperlinks(url):
             if not response.info().get('Content-Type').startswith("text/html"):
                 return []
             
-            # Decode the HTML
-            html = response.read().decode('utf-8')
+            # Get the encoding from the response header
+            encoding = response.headers.get_content_charset()
+            if encoding is None:
+                encoding = 'utf-8'
+
+            if response.info().get('Content-Encoding') == 'gzip':
+                with gzip.GzipFile(fileobj=io.BytesIO(response.read())) as decompressed_file:
+                    html = decompressed_file.read().decode(encoding)
+            else:
+                html = response.read().decode(encoding)
+
     except Exception as e:
         print(e)
         return []
@@ -114,6 +151,7 @@ def get_domain_hyperlinks(local_domain, url):
 
 def crawl(url):
     # Parse the URL and get the domain
+        
     local_domain = urlparse(url).netloc
 
     # Create a queue to store the URLs to crawl
@@ -123,6 +161,7 @@ def crawl(url):
     seen = set([url])
 
     # Create a directory to store the text files
+    # change this
     if not os.path.exists("app/webcrawler/text/"):
             os.mkdir("app/webcrawler/text/")
 
@@ -139,23 +178,24 @@ def crawl(url):
         # Get the next URL from the queue
         url = queue.pop()
         print(url) # for debugging and to see the progress
-
+        
         # Save text from the url to a <url>.txt file
         with open('app/webcrawler/text/'+local_domain+'/'+url[8:].replace("/", "_") + ".txt", "w", encoding="UTF-8") as f:
-
+        
             # Get the text from the URL using BeautifulSoup
-            soup = BeautifulSoup(requests.get(url).text, "html.parser")
-
-            # Get the text but remove the tags
-            text = soup.get_text()
-
-            # If the crawler gets to a page that requires JavaScript, it will stop the crawl
-            if ("You need to enable JavaScript to run this app." in text):
-                print("Unable to parse page " + url + " due to JavaScript being required")
+            try:
+                soup = BeautifulSoup(requests.get(url).text, "html.parser")
+                # Get the text but remove the tags
+                text = soup.get_text()
+                # If the crawler gets to a page that requires JavaScript, it will stop the crawl
+                if ("You need to enable JavaScript to run this app." in text):
+                    print("Unable to parse page " + url + " due to JavaScript being required")
+                
+                # Otherwise, write the text to the file in the text directory
+                f.write(text)
+            except Exception as e:
+                print(f"Error occurred while parsing: {e}")
             
-            # Otherwise, write the text to the file in the text directory
-            f.write(text)
-
         # Get the hyperlinks from the URL and add them to the queue
         for link in get_domain_hyperlinks(local_domain, url):
             if link not in seen:
@@ -175,25 +215,36 @@ def remove_newlines(serie):
     serie = serie.str.replace('  ', ' ')
     return serie
 
-
 ################################################################################
 ### Step 6
 ################################################################################
 
 # Create a list to store the text files
 def prep_df(domain):
-
+    directory_path = "app/webcrawler/text/" + "www." + domain
+    
+    if not os.path.exists(directory_path):
+        print(f"Directory does not exist: {directory_path}")
+        return
+    
     texts=[]
 
+    try:
+        for file in os.listdir(directory_path):
+            with open(directory_path + "/" + file, "r", encoding="UTF-8") as f:
+                text = f.read()
+                texts.append((file[11:-4].replace('-',' ').replace('_', ' ').replace('#update',''), text))
+    except FileNotFoundError:
+        print(f"Directory {directory_path} not found")
 # Get all the text files in the text directory
-    for file in os.listdir("app/webcrawler/text/" + domain + "/"):
+    # for file in os.listdir("app/webcrawler/text/" + domain):
 
-        # Open the file and read the text
-        with open("app/webcrawler/text/" + domain + "/" + file, "r", encoding="UTF-8") as f:
-            text = f.read()
+    #     # Open the file and read the text
+    #     with open("app/webcrawler/text/" + domain + "/" + file, "r", encoding="UTF-8") as f:
+    #         text = f.read()
 
-            # Omit the first 11 lines and the last 4 lines, then replace -, _, and #update with spaces.
-            texts.append((file[11:-4].replace('-',' ').replace('_', ' ').replace('#update',''), text))
+    #         # Omit the first 11 lines and the last 4 lines, then replace -, _, and #update with spaces.
+    #         texts.append((file[11:-4].replace('-',' ').replace('_', ' ').replace('#update',''), text))
 
     # Create a dataframe from the list of texts
     df = pd.DataFrame(texts, columns = ['fname', 'text'])
@@ -294,92 +345,145 @@ def prep_df(domain):
 
 
     df['embeddings'] = df.text.apply(lambda x: openai.Embedding.create(input=x, engine='text-embedding-ada-002')['data'][0]['embedding'])
-    df.to_csv('app/webcrawler/processed/embeddings.csv')
+    # store the df into Pinecone DB.
+    
+    # Add an 'id' column to the DataFrame
+    df['id'] = [str(uuid4()) for _ in range(len(df))]
+
+    # Define index name
+    index_name = 'quickquacktest'
+    nspace = extract_domain_name(domain=domain)
+
+
+    # Initialize connection to Pinecone
+    pinecone.init(api_key=PINECONE_API_KEY, environment=PINECONE_API_ENV)
+
+    # Check if index already exists, create it if it doesn't
+    try:
+        if index_name not in pinecone.list_indexes():
+            pinecone.create_index(index_name, dimension=1536, metric='dotproduct')
+    except Exception as e:
+        print(e)
+  
+
+    # Connect to the index and view index stats
+    index = pinecone.Index(index_name)
+    index.describe_index_stats()
+
+    batch_size = 100  # how many embeddings we create and insert at once
+    # Upsert ends up adding duplicate vectors instead of updating, So delete the exsisting namespace before adding new vectors.
+    try:
+        print("delete start")
+        delete_response = index.delete(delete_all=True,namespace=nspace) # With Namespace.
+        delete_response = index.delete(delete_all=True)
+        print("delete end")
+    except Exception as e:
+        print(e)
+
+    # Convert the DataFrame to a list of dictionaries
+    text_chunks = df.to_dict(orient='records')
+
+
+    # Upsert embeddings into Pinecone in batches of 100
+    for i in tqdm(range(0, len(text_chunks), batch_size)):
+        i_end = min(len(text_chunks), i+batch_size)
+        meta_batch = text_chunks[i:i_end]
+        ids_batch = [x['id'] for x in meta_batch]
+        embeds = [x['embeddings'] for x in meta_batch]
+        meta_batch = [{
+            'text': x['text']
+        } for x in meta_batch]
+        to_upsert = list(zip(ids_batch, embeds, meta_batch))
+        index.upsert(vectors=to_upsert, namespace=nspace) # With Namespace.
+        # index.upsert(vectors=to_upsert)
+        print("upsert done")
+    
+    if os.path.exists("app/webcrawler/text/"):
+        shutil.rmtree("app/webcrawler/text/")
+    
+    if os.path.exists("app/webcrawler/processed"):
+        shutil.rmtree("app/webcrawler/processed")
 
 
 ################################################################################
 ### Step 11
 ################################################################################
 
-    df=pd.read_csv('app/webcrawler/processed/embeddings.csv', index_col=0)
-    df['embeddings'] = df['embeddings'].apply(eval).apply(np.array)
+    #df=pd.read_csv('app/webcrawler/processed/embeddings.csv', index_col=0)
+    #df['embeddings'] = df['embeddings'].apply(eval).apply(np.array)
 
-    return df
+    #return df
 
 ################################################################################
 ### Step 12
 ################################################################################
 
-def create_context(
-    question, df, max_len=1800, size="ada"
-):
-    """
-    Create a context for a question by finding the most similar context from the dataframe
-    """
+limit = 3750
 
-    # Get the embeddings for the question
-    q_embeddings = openai.Embedding.create(input=question, engine='text-embedding-ada-002')['data'][0]['embedding']
-
-    # Get the distances from the embeddings
-    df['distances'] = distances_from_embeddings(q_embeddings, df['embeddings'].values, distance_metric='cosine')
-
-
-    returns = []
-    cur_len = 0
-
-    # Sort by distance and add the text to the context until the context is too long
-    for i, row in df.sort_values('distances', ascending=True).iterrows():
-        
-        # Add the length of the text to the current length
-        cur_len += row['n_tokens'] + 4
-        
-        # If the context is too long, break
-        if cur_len > max_len:
-            break
-        
-        # Else add it to the text that is being returned
-        returns.append(row["text"])
-
-    # Return the context
-    return "\n\n###\n\n".join(returns)
-
-def answer_question(
-    df,
-    model="text-davinci-003",
-    question="Am I allowed to publish model outputs to Twitter, without a human review?",
-    max_len=1800,
-    size="ada",
-    debug=False,
-    max_tokens=150,
-    stop_sequence=None
-):
-    """
-    Answer a question based on the most similar context from the dataframe texts
-    """
-    context = create_context(
-        question,
-        df,
-        max_len=max_len,
-        size=size,
+def retrieve(query, domain):
+    res = openai.Embedding.create(
+        input=[query],
+        engine='text-embedding-ada-002'
     )
-    # If debug, print the raw model response
-    if debug:
-        print("Context:\n" + context)
-        print("\n\n")
+    namespace = extract_domain_name(domain=domain)
+    # Define index name
+    index_name = 'quickquacktest'
+    # Connect to the index and view index stats
+    index = pinecone.Index(index_name)
+    index.describe_index_stats()
+
+
+    # retrieve from Pinecone
+    xq = res['data'][0]['embedding']
+
+    # get relevant contexts
+    res = index.query(xq, top_k=3, include_metadata=True, namespace=namespace)
+    contexts = [
+        x['metadata']['text'] for x in res['matches']
+    ]
+
+    # build our prompt with the retrieved contexts included
+    prompt_start = (
+        "Answer the question based on the context below. If you don't know the answer, just say that you don't know. Don't try to make up an answer.\n\n"+
+        "Context:\n"
+    )
+    prompt_end = (
+        f"\n\nQuestion: {query}\nAnswer:"
+    )
+
+    # Initialize prompt with a default value
+    # prompt = "No context found"
+    # append contexts until hitting limit
+    for i in range(1, len(contexts)):
+        if len("\n\n---\n\n".join(contexts[:i])) >= limit:
+            prompt = (
+                prompt_start +
+                "\n\n---\n\n".join(contexts[:i-1]) +
+                prompt_end
+            )
+            break
+        elif i == len(contexts)-1:
+            prompt = (
+                prompt_start +
+                "\n\n---\n\n".join(contexts) +
+                prompt_end
+            )
+    return prompt
+
+    
+def answer_question(question, domain):
+
+    query_with_contexts = retrieve(question, domain)
 
     try:
-        # Create a completions using the questin and context
-        response = openai.Completion.create(
-            prompt=f"Answer the question based on the context below, and if the question can't be answered based on the context, say \"I don't know\"\n\nContext: {context}\n\n---\n\nQuestion: {question}\nAnswer:",
-            temperature=0,
-            max_tokens=max_tokens,
-            top_p=1,
-            frequency_penalty=0,
-            presence_penalty=0,
-            stop=stop_sequence,
-            model=model,
+        chat = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": "You are a Q&A assistant."},
+                {"role": "user", "content": query_with_contexts}
+            ]
         )
-        return response["choices"][0]["text"].strip()
+        return chat["choices"][0]['message']['content']
     except Exception as e:
         print(e)
         return ""
